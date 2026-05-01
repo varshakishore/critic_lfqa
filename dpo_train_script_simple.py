@@ -14,9 +14,9 @@ from trl import DPOTrainer, DPOConfig
 
 
 # ---- Config ----
-# MODEL_NAME = "rl-research/DR-Tulu-8B"  # swap for your SFT model
+MODEL_NAME = "rl-research/DR-Tulu-8B"  # swap for your SFT model
 # MODEL_NAME = "Qwen/Qwen3-0.6B"  # swap for your SFT model
-DATASET_NAME = "varshak1/dpo_fg_synthetic_data"
+# DATASET_NAME = "varshak1/dpo_fg_synthetic_data"
 DATASET_NAME = "varshak1/dpo_fg_control_synthetic_data"
 OUTPUT_DIR = "./dpo-output-control"
 
@@ -115,7 +115,7 @@ def main():
     # ---- Training config ----
     training_args = DPOConfig(
         output_dir=OUTPUT_DIR,
-        num_train_epochs=3,
+        num_train_epochs=1,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=16,
         gradient_checkpointing=True,
