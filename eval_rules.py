@@ -214,7 +214,6 @@ def evaluate(model, tokenizer, prompts: list, max_new_tokens: int) -> tuple[dict
 
             out = model.generate(input_ids, max_new_tokens=max_new_tokens, do_sample=False)
             generated = tokenizer.decode(out[0, input_ids.shape[-1]:], skip_special_tokens=True)
-
             m = re.search(r'<answer>(.*?)(?:</answer>|$)', generated, re.DOTALL)
             if not m:
                 per_sample.append({"generated": generated, "answer": None, "rules": {}})
