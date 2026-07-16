@@ -22,10 +22,14 @@ MODEL_COSTS = {
     "gpt-5":        (1.25, 10.00),
     "o3":          (10.00, 40.00),
     "o4-mini":      (1.10,  4.40),
+    "gpt-5.4":      (2.50, 15.00),
 }
 
-MODEL      = "gpt-4.1"
-INPUT_FILE = "critique_outputs_v3_single_test_rewriting.jsonl"
+MODEL      = "gpt-5.4"
+# INPUT_FILE = "critique_outputs_v3_single_test_rewriting.jsonl"
+# OUTPUT_FILE = INPUT_FILE.replace(".jsonl", "_rewritten.jsonl")
+
+INPUT_FILE = "test_50/drtulu_answers_w_critiques.jsonl"
 OUTPUT_FILE = INPUT_FILE.replace(".jsonl", "_rewritten.jsonl")
 
 # %%
@@ -44,7 +48,8 @@ You are given:
 
 Your task:
 - The trace below has certain spans wrapped in <can_edit>...</can_edit> tags. You may ONLY edit text inside those tags. Every character outside a <can_edit> block must be reproduced exactly as-is.
-- For each new search query listed below, insert a <think>brief reflection</think> followed by a <call_tool> block and <tool_output>PLACEHOLDER_{id}</tool_output>. You can only add the queries in the <can_edit> spans.
+- Edit the trace to address the critiques.
+- For each new search query listed below, insert a <think>brief reflection</think> followed by a <call_tool> block and <tool_output>PLACEHOLDER_{{id}}</tool_output>. You can only add the queries in the <can_edit> spans.
 - Output the full revised trace with no preamble or explanation.
 
 ---
@@ -69,7 +74,7 @@ answer_rewrite_prompt = """You are making edits to improve a long-form answer to
 You are given:
 1. The planning trace which contains reasoning steps and search results.
 2. The original answer.
-3. Answer-level critiques, each identifying a specific flagged span (start_end) and describing the issue.
+3. Answer-level critiques, each identifying a specific flagged span (critique_span) and describing the issue.
 
 Your task:
 - The answer below has certain spans wrapped in <can_edit>...</can_edit> tags. You may ONLY edit text inside those tags. Every character outside a <can_edit> block must be reproduced exactly as-is.
@@ -136,11 +141,11 @@ def make_call_tool_block(query_dict, id_prefix):
 
 
 def insert_can_edit_tags(text, critiques):
-    """Wrap each flagged start_end span with <can_edit>...</can_edit> tags.
+    """Wrap each flagged critique_span span with <can_edit>...</can_edit> tags.
     Spans are inserted in reverse order so earlier positions aren't shifted."""
     spans = []
     for c in critiques:
-        for start_str, end_str in c.get("start_end", []):
+        for start_str, end_str in c.get("edit_span", c.get("critique_span", [])):
             start_key = start_str[:40]
             end_key   = end_str[-40:]
             idx_s = text.find(start_key)

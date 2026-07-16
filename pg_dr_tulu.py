@@ -4,6 +4,9 @@ from openai import OpenAI
 from tqdm import tqdm
 import os
 import requests
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datasets import load_dataset
 
 # %%
 OAI_KEY = os.environ["OPENAI_API_KEY"] 
@@ -128,12 +131,14 @@ Please provide critiques in the following JSON format:
 
 {{
   "local": [
-      {{"start_end": [[beginning few words, ending few words], ...], "location": "plan" or "answer" or "both", "issue": description of the issue, "tag": 3-5 word label for the issue, "organization_related": true/false, "search_required": true/false, "s2_search_queries": list of search query dicts (only if search_required is true)}}
+      {{"critique_span": [[beginning few words, ending few words], ...], "edit_span": [[beginning few words, ending few words], ...], "location": "plan" or "answer" or "both", "issue": description of the issue, "tag": 3-5 word label for the issue, "organization_related": true/false, "search_required": true/false, "s2_search_queries": list of search query dicts (only if search_required is true)}}
   ],
 }}
 
 Rules:
-- "start_end" is a list of [start, end] pairs, where each pair identifies a text span by its first few words and last few words; use multiple pairs when the critique applies to disjoint parts, or an empty list for issues with no specific span.
+- "critique_span" is a list of [start, end] pairs identifying the text the critique is about (the diagnostic span); use multiple pairs when the critique applies to disjoint parts, or an empty list if there is no specific span.
+- "edit_span" identifies where the fix is applied. Usually it is the same as "critique_span". There might be exceptions like when inserting new content rather than rewriting existing text.
+- When inserting new content rather than rewriting existing text, set start and end to the same string to signal an insertion point immediately after that string.
 - Be concrete and specific.
 - Do not include any content outside the JSON object.
 - "location" should be "plan" if the issue is in a <think> or <call_tool> block, or "answer" if it is in the <answer> block.
@@ -144,16 +149,18 @@ Rules:
 
 Example of critiques:
 {{
-  "start_end": [["Alignment Metrics: Another fine-grained strategy", "on many benchmark tasks."]],
+  "critique_span": [["Alignment Metrics: Another fine-grained strategy", "on many benchmark tasks."]],
+  "edit_span": [["Alignment Metrics: Another fine-grained strategy", "on many benchmark tasks."]],
   "location": "answer",
   "issue": "This paragraph is irrelevant to the question asked and should be removed.",
   "tag": "irrelevant content",
   "search_required": false
 }}
 {{
-  "start_end": [["I will retrieve evidence on attention mechanisms", "and multi-head attention variants."]],
+  "critique_span": [["I will retrieve evidence on attention mechanisms", "and multi-head attention variants."]],
+  "edit_span": [["for large generative LLMs.", "for large generative LLMs."]],
   "location": "plan",
-  "issue": "The plan intends to cover attention mechanisms but the retrieved results do not include the foundational Transformer paper (Vaswani et al., 2017), which is essential for this topic.",
+  "issue": "The plan intends to cover attention mechanisms but the retrieved results do not include the foundational Transformer paper (Vaswani et al., 2017), which is essential for this topic. A new search should be inserted after the existing tool output.",
   "tag": "missing key paper",
   "search_required": true,
   "s2_search_queries": [
@@ -161,14 +168,16 @@ Example of critiques:
   ]
 }}
 {{
-  "start_end": [["<cite id="e581542a-1">Another development is to", "with the right prompt."]],
+  "critique_span": [["<cite id="e581542a-1">Another development is to", "with the right prompt."]],
+  "edit_span": [["<cite id="e581542a-1">Another development is to", "with the right prompt."]],
   "location": "answer",
   "issue": "This citation does not support the claim made in the sentence. The sentence should be revised or dropped when the answer is rewritten.",
   "tag": "incorrect citation",
   "search_required": false
 }}
 {{
-  "start_end": [],
+  "critique_span": [],
+  "edit_span": [["rationales can be unreliable. ", "rationales can be unreliable. "]],
   "issue": "The plan does not search for any recent work on reward model training for math, leaving a significant gap in coverage.",
   "location": "both",
   "tag": "add section",
@@ -178,21 +187,24 @@ Example of critiques:
   ]
 }}
 {{
-  "start_end": [["Evaluation results show that", "on the held-out test set."], ["We further evaluate the model", "across all three benchmarks."]],
+  "critique_span": [["Evaluation results show that", "on the held-out test set."], ["We further evaluate the model", "across all three benchmarks."]],
+  "edit_span": [["Evaluation results show that", "on the held-out test set."], ["We further evaluate the model", "across all three benchmarks."]],
   "issue": "Group all the evaluation-related content into a single section to improve organization.",
   "location": "answer",
   "tag": "reorganize",
   "search_required": false
 }}
 {{
-  "start_end": [],
+  "critique_span": [],
+  "edit_span": [["<answer>\n # Why traditional ", "<answer>\n # Why traditional "]],
   "issue": "The question asks true or false, but the answer is structured as an essay. Add a true/false explanation at the beginning.",
   "location": "answer",
   "tag": "add takeaway sentence",
   "search_required": false
 }}
 {{
-  "start_end": [["Monte Carlo search has been applied", "across many planning tasks."]],
+  "critique_span": [["Monte Carlo search has been applied", "across many planning tasks."]],
+  "edit_span": [["Monte Carlo search has been applied", "across many planning tasks."]],
   "issue": "The paragraph about monte carlo search is not relevant to the question asked and should be removed.",
   "location": "answer",
   "tag": "delete section",
@@ -220,18 +232,37 @@ MODEL_COSTS = {
 }
 
 MODEL = "gpt-5.4"
+MAX_WORKERS = 10
+LIMIT = 3
 
 total_cost = 0.0
+cost_lock = threading.Lock()
+write_lock = threading.Lock()
 
-input_file = 'sqav2_single.jsonl'
-# read jsonl
-with open(input_file, 'r') as f:
-    data = [json.loads(line) for line in f.readlines()]
+input_file = "test_50/drtulu_answers.jsonl"  # set to a .jsonl path to use a local file, or None to load from HF
+output_file = 'critique_outputs_v3_single.jsonl'
 
-for i in tqdm(range(len(data))):
-    if i==3:
-        break
-    sample = data[i]
+if input_file is not None:
+    answers_output_fname = input_file.replace('.jsonl', '_w_critiques.jsonl')
+    with open(input_file, 'r') as f:
+        data = [json.loads(line) for line in f.readlines()]
+    data = data[:LIMIT]
+else:
+    answers_output_fname = 'test_50/drtulu_answers.jsonl'
+    ds = load_dataset("rl-research/dr-tulu-rl-data", split="train")
+    ds = ds.filter(lambda row: 'sqa_1k' in (row['source'] or ''))
+    data = []
+    for row in ds:
+        msgs = row['messages']
+        question = next((m['content'] for m in msgs if m['role'] == 'user'), None)
+        if question:
+            data.append({'problem': question})
+        if len(data) >= LIMIT:
+            break
+
+
+def process_sample(sample):
+    global total_cost
     problem = sample['problem']
 
     if 'full_traces' not in sample or 'final_response' not in sample:
@@ -239,35 +270,46 @@ for i in tqdm(range(len(data))):
         r1_json = r1.json()
         generated_text = r1_json['trace']['generated_text']
         answer = r1_json['answer']
-        answers_output_fname = input_file.replace('.jsonl', '_w_answers.jsonl')
-        with open(answers_output_fname, 'a') as f:
-            f.write(json.dumps({
-                'problem': problem,
-                'final_response': answer,
-                'full_traces': generated_text
-            }) + '\n')
+        with write_lock:
+            with open(answers_output_fname, 'a') as f:
+                f.write(json.dumps({
+                    'problem': problem,
+                    'final_response': answer,
+                    'full_traces': generated_text
+                }) + '\n')
     else:
         generated_text = sample['full_traces']
         answer = sample['final_response']
 
     prompt = updated_prompt_v1.format(problem, generated_text)
+    response = client.responses.create(model=MODEL, input=prompt)
 
-    response = client.responses.create(
-        model=MODEL,
-        input=prompt
-    )
-
-    # write response to file
-    with open('critique_outputs_v3_single.jsonl', 'a') as f:
-        f.write(json.dumps({
-            'question': sample['problem'],
-            'original_answer': answer,
-            'original_trace': generated_text,
-            'critique': response.output_text
-        }) + '\n')
-
-    # compute cost
     input_price, output_price = MODEL_COSTS.get(MODEL, (0.0, 0.0))
     cost = response.usage.input_tokens * input_price / 1_000_000 + response.usage.output_tokens * output_price / 1_000_000
-    total_cost += cost
-    print(f"Cost for this sample: ${cost:.6f}, Total cost so far: ${total_cost:.6f}")
+
+    with write_lock:
+        with open(output_file, 'a') as f:
+            f.write(json.dumps({
+                'question': problem,
+                'original_answer': answer,
+                'original_trace': generated_text,
+                'critique': response.output_text
+            }) + '\n')
+
+    with cost_lock:
+        total_cost += cost
+        print(f"[{problem[:50]}]  cost=${cost:.4f}  total=${total_cost:.4f}")
+
+    return cost
+
+
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    futures = {executor.submit(process_sample, sample): sample for sample in data}
+    for future in tqdm(as_completed(futures), total=len(data)):
+        try:
+            future.result()
+        except Exception as e:
+            sample = futures[future]
+            print(f"Error on '{sample['problem'][:60]}': {e}")
+
+print(f"\nTotal cost: ${total_cost:.4f}")
