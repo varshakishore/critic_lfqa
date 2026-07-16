@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "rewriting",
+  "project_id": "ab919c33-fcf6-4bab-945d-7be0446f6591"
+}
