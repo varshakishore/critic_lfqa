@@ -132,12 +132,14 @@ Please provide critiques in the following JSON format:
 {{
   "local": [
       {{"critique_span": [[beginning few words, ending few words], ...], "edit_span": [[beginning few words, ending few words], ...], "location": "plan" or "answer" or "both", "issue": description of the issue, "tag": 3-5 word label for the issue, "organization_related": true/false, "search_required": true/false, "s2_search_queries": list of search query dicts (only if search_required is true)}}
-  ],
+  ]
 }}
 
 Rules:
 - "critique_span" is a list of [start, end] pairs identifying the text the critique is about (the diagnostic span); use multiple pairs when the critique applies to disjoint parts, or an empty list if there is no specific span.
-- "edit_span" identifies where the fix is applied. Usually it is the same as "critique_span". There might be exceptions like when inserting new content rather than rewriting existing text.
+- "edit_span" identifies where the fix is applied. Usually it is the same as "critique_span". There might be exceptions like when inserting a new section or a new search call.
+- For "critique_span" and "edit_span", every pair MUST contain EXACTLY TWO strings: [start, end].
+- Both "start" and "end" must be copied VERBATIM from the trace: preserving exact punctuation, capitalization, whitespace, and any inline tags. Do not paraphrase, summarize, or fix typos.
 - When inserting new content rather than rewriting existing text, set start and end to the same string to signal an insertion point immediately after that string.
 - Be concrete and specific.
 - Do not include any content outside the JSON object.
@@ -235,12 +237,14 @@ MODEL_COSTS = {
 MODEL = "gpt-5.4"
 MAX_WORKERS = 10
 LIMIT = 10   # how many answers to critique (drtulu_answers.jsonl has 50)
+COST_LIMIT = 100.0   # stop starting new critiques once total cost exceeds this ($)
 # When set, only generate DR Tulu answers (via localhost:8007) and skip critiquing.
 ANSWER_ONLY = os.environ.get("ANSWER_ONLY", "0") == "1"
 
 total_cost = 0.0
 cost_lock = threading.Lock()
 write_lock = threading.Lock()
+stop_event = threading.Event()   # set when COST_LIMIT is exceeded
 
 input_file = "test_samples/drtulu_answers.jsonl"  # set to a .jsonl path to use a local file, or None to load from HF
 output_file = "test_samples/drtulu_answers_w_critiques.jsonl"  # the file the rewrite pipeline reads
@@ -281,6 +285,8 @@ print(f"{_before} candidates | {len(done)} already critiqued | {len(data)} to ge
 
 def process_sample(sample):
     global total_cost
+    if stop_event.is_set():           # cost cap already hit — skip remaining work
+        return 0.0
     problem = sample['problem']
 
     if 'full_traces' not in sample or 'final_response' not in sample:
@@ -320,6 +326,10 @@ def process_sample(sample):
     with cost_lock:
         total_cost += cost
         print(f"[{problem[:50]}]  cost=${cost:.4f}  total=${total_cost:.4f}")
+        if total_cost >= COST_LIMIT and not stop_event.is_set():
+            stop_event.set()
+            print(f"⚠ COST LIMIT ${COST_LIMIT:.2f} exceeded (total=${total_cost:.2f}); "
+                  f"skipping remaining critiques.")
 
     return cost
 
