@@ -9,8 +9,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datasets import load_dataset
 
 # %%
-OAI_KEY = os.environ["OPENAI_API_KEY"] 
-client = OpenAI(api_key=OAI_KEY)
+# OAI_KEY = os.environ["OPENAI_API_KEY"] 
+# client = OpenAI(api_key=OAI_KEY)
 
 
 # updated_prompt = """
@@ -233,8 +233,8 @@ MODEL_COSTS = {
 }
 
 MODEL = "gpt-5.4"
-MAX_WORKERS = 10
-LIMIT = 10   # how many answers to critique (drtulu_answers.jsonl has 50)
+MAX_WORKERS = 20
+LIMIT = 1000   # how many answers to critique (drtulu_answers.jsonl has 50)
 # When set, only generate DR Tulu answers (via localhost:8007) and skip critiquing.
 ANSWER_ONLY = os.environ.get("ANSWER_ONLY", "0") == "1"
 
@@ -242,8 +242,11 @@ total_cost = 0.0
 cost_lock = threading.Lock()
 write_lock = threading.Lock()
 
-input_file = "test_samples/drtulu_answers.jsonl"  # set to a .jsonl path to use a local file, or None to load from HF
-output_file = "test_samples/drtulu_answers_w_critiques.jsonl"  # the file the rewrite pipeline reads
+# input_file = "test_samples/drtulu_answers.jsonl"  # set to a .jsonl path to use a local file, or None to load from HF
+# output_file = "test_samples/drtulu_answers_w_critiques.jsonl"  # the file the rewrite pipeline reads
+
+input_file = None
+output_file = "samples_1000/drtulu_answers_w_critiques.jsonl"
 
 if input_file is not None:
     answers_output_fname = input_file.replace('.jsonl', '_w_critiques.jsonl')
@@ -251,7 +254,7 @@ if input_file is not None:
         data = [json.loads(line) for line in f.readlines()]
     data = data[:LIMIT]
 else:
-    answers_output_fname = 'test_50/drtulu_answers.jsonl'
+    answers_output_fname = 'samples_1000/drtulu_answers.jsonl'
     ds = load_dataset("rl-research/dr-tulu-rl-data", split="train")
     ds = ds.filter(lambda row: 'sqa_1k' in (row['source'] or ''))
     data = []
