@@ -579,11 +579,21 @@ with open(INPUT_FILE, "r") as f:
 
 print(f"Loaded {len(records)} records from {INPUT_FILE}.")
 
-# Start each run with a fresh output file. Records are still appended per-record
-# below (for crash-safety / live progress), but truncating here means re-running
-# the same model+RUN_TAG overwrites instead of silently accumulating duplicates.
-open(OUTPUT_FILE, "w").close()
-print(f"Output → {OUTPUT_FILE}")
+# Resume: skip records already written to OUTPUT_FILE and APPEND, so a re-run
+# continues where a crashed run left off (no re-doing / re-paying). To force a
+# clean run from scratch, delete OUTPUT_FILE (or bump RUN_TAG) first.
+done = set()
+if os.path.exists(OUTPUT_FILE):
+    with open(OUTPUT_FILE) as _f:
+        for _line in _f:
+            if _line.strip():
+                try:
+                    done.add(json.loads(_line)["question"])
+                except Exception:
+                    pass  # tolerate a partial last line from a crash mid-write
+_before = len(records)
+records = [r for r in records if r.get("question", "").strip() not in done]
+print(f"Output → {OUTPUT_FILE} | {_before} loaded | {len(done)} already done | {len(records)} to do")
 
 # %%
 total_cost = 0.0
