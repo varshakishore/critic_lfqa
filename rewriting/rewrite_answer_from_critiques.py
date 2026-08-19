@@ -4,7 +4,9 @@ import os
 import re
 import time
 import difflib
+import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 from tqdm import tqdm
 
@@ -52,7 +54,13 @@ MODEL_COSTS = {
 
 MODEL      = GPT_MODEL if BACKEND == "gpt" else GLM_MODEL
 
-INPUT_FILE = "test_samples/drtulu_answers_w_critiques.jsonl"
+# Stop starting new records once cumulative cost exceeds this ($). Override via env.
+COST_LIMIT = 100
+# Process records concurrently. Note: higher values hit the S2 snippet endpoint
+# harder (more 429s without an S2_API_KEY). Override via env.
+MAX_WORKERS = 20
+
+INPUT_FILE = "samples_1000/drtulu_answers_w_critiques.jsonl"
 # tag output by model AND a run tag so different models/runs don't clobber each
 # other. Bump RUN_TAG (e.g. v2) for a fresh file; override either via env.
 RUN_TAG = os.environ.get("RUN_TAG", "v3")
@@ -534,6 +542,34 @@ def validate_trace_structure(trace):
     return problems
 
 
+def parse_critique(s):
+    """Parse the critique JSON, with a repair pass for the common failure mode:
+    the model copies HTML-like tags (e.g. <cite id="x">) verbatim into string
+    values, and their inner double quotes break the JSON. We escape unescaped
+    quotes inside <...> tags and retry. Returns the parsed object, or None if it
+    still won't parse (idiosyncratic structural errors — skipped by the caller)."""
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    repaired = re.sub(r"<[^<>]*>",
+                      lambda m: re.sub(r'(?<!\\)"', lambda _: '\\"', m.group(0)),
+                      s)
+    try:
+        return json.loads(repaired)
+    except Exception:
+        return None
+
+
+def extract_answer_block(trace):
+    """Return the <answer>…</answer> block. Falls back to <answer>…end-of-trace
+    when the closing tag is missing (truncated generation), and None when there
+    is no <answer> at all."""
+    m = (re.search(r"<answer>.*?</answer>", trace, flags=re.DOTALL)
+         or re.search(r"<answer>.*\Z", trace, flags=re.DOTALL))
+    return m.group(0) if m else None
+
+
 # %%
 records = []
 with open(INPUT_FILE, "r") as f:
@@ -556,21 +592,27 @@ input_price, output_price = MODEL_COSTS.get(MODEL, (0.0, 0.0))
 if MODEL not in MODEL_COSTS:
     print(f"⚠ no pricing for MODEL={MODEL!r}; costs will show $0 (token counts still logged).")
 
+cost_lock  = threading.Lock()   # guards total_cost / total_in / total_out
+write_lock = threading.Lock()   # guards appends to OUTPUT_FILE
+stop_event = threading.Event()  # set once COST_LIMIT is exceeded
+
 
 def usd(in_tok, out_tok):
     return in_tok * input_price / 1_000_000 + out_tok * output_price / 1_000_000
 
 
-for item in tqdm(records):
+def process_record(item):
+    global total_cost, total_in, total_out
+    if stop_event.is_set():            # cost cap already hit — don't start new work
+        return
     question        = item["question"].strip()
     trace           = item.get("original_trace", "")
     critique_str    = item.get("critique", "[]")
 
-    try:
-        critique_json = json.loads(critique_str)
-    except json.JSONDecodeError as e:
-        print(f"Failed to parse critique for '{question[:60]}': {e}")
-        continue
+    critique_json = parse_critique(critique_str)
+    if critique_json is None:
+        print(f"  ⚠ unparseable critique for '{question[:60]}' — skipping record")
+        return
 
     all_critiques    = critique_json if isinstance(critique_json, list) else critique_json.get("local", [])
     plan_critiques   = [c for c in all_critiques if c.get("location") in ("plan", "both")]
@@ -675,7 +717,10 @@ for item in tqdm(records):
     # <answer>…</answer> wrapper. Critiques were generated against the full
     # trace, so their edit_span anchors include the wrapper (e.g. "<answer>\n#
     # Summary"); the wrapper-less `original_answer` field would fail to match.
-    answer_block = re.search(r"<answer>.*?</answer>", trace, flags=re.DOTALL).group(0)
+    answer_block = extract_answer_block(trace)
+    if answer_block is None:
+        print(f"  ⚠ no <answer> block in trace for '{question[:50]}' — skipping record")
+        return
     answer_tagged = insert_can_edit_tags(answer_block, answer_critiques)
 
     step3_prompt = answer_rewrite_prompt.format(
@@ -694,32 +739,46 @@ for item in tqdm(records):
     if ans_dropped > 1000:
         print(f"  ⚠ ANSWER: reverted {ans_dropped} chars of OUT-OF-BOUNDS model edits for '{question[:50]}'")
 
-    # ── Cost accounting: every model call (step1 in-place, reflections, step3) ──
+    # ── Cost accounting (shared state; under lock) ────────────────────────────
     cost1, cost_refl, cost3 = usd(s1_in, s1_out), usd(refl_in, refl_out), usd(s3_in, s3_out)
     rec_in  = s1_in + refl_in + s3_in
     rec_out = s1_out + refl_out + s3_out
     rec_cost = cost1 + cost_refl + cost3
-    total_cost += rec_cost
-    total_in  += rec_in
-    total_out += rec_out
-    print(f"  Cost [{MODEL}]  "
-          f"step1(in={s1_in} out={s1_out} ${cost1:.4f})  "
-          f"refl(in={refl_in} out={refl_out} ${cost_refl:.4f})  "
-          f"step3(in={s3_in} out={s3_out} ${cost3:.4f})  |  "
-          f"record: {rec_in}+{rec_out}tok ${rec_cost:.4f}  |  "
-          f"RUNNING: {total_in}+{total_out}tok ${total_cost:.4f}")
+    with cost_lock:
+        total_cost += rec_cost
+        total_in  += rec_in
+        total_out += rec_out
+        print(f"  Cost [{MODEL}]  "
+              f"step1(in={s1_in} out={s1_out} ${cost1:.4f})  "
+              f"refl(in={refl_in} out={refl_out} ${cost_refl:.4f})  "
+              f"step3(in={s3_in} out={s3_out} ${cost3:.4f})  |  "
+              f"record: {rec_in}+{rec_out}tok ${rec_cost:.4f}  |  "
+              f"RUNNING: {total_in}+{total_out}tok ${total_cost:.4f}")
+        if total_cost >= COST_LIMIT and not stop_event.is_set():
+            stop_event.set()
+            print(f"⚠ COST LIMIT ${COST_LIMIT:.2f} reached (total=${total_cost:.4f}); no new records will start.")
 
-    # import pdb; pdb.set_trace()
-    with open(OUTPUT_FILE, "a") as f:
-        f.write(json.dumps({
-            "question":        question,
-            "original_answer": answer_block,
-            "original_trace":  trace,
-            "rewritten_trace": rewritten_trace,
-            "critique":        critique_str,
-            "rewritten":       rewritten_answer,
-        }) + "\n")
+    with write_lock:
+        with open(OUTPUT_FILE, "a") as f:
+            f.write(json.dumps({
+                "question":        question,
+                "original_answer": answer_block,
+                "original_trace":  trace,
+                "rewritten_trace": rewritten_trace,
+                "critique":        critique_str,
+                "rewritten":       rewritten_answer,
+            }) + "\n")
 
-print(f"\n=== DONE: {len(records)} records | model={MODEL} | "
+
+# ── Drive records concurrently ────────────────────────────────────────────────
+with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    futures = {executor.submit(process_record, item): item for item in records}
+    for fut in tqdm(as_completed(futures), total=len(records)):
+        try:
+            fut.result()
+        except Exception as e:
+            print(f"Error on a record: {e}")
+
+print(f"\n=== DONE: {len(records)} records | model={MODEL} | workers={MAX_WORKERS} | "
       f"{total_in} input + {total_out} output tokens | TOTAL COST ${total_cost:.4f} ===")
 print(f"Output: {OUTPUT_FILE}")
