@@ -495,45 +495,64 @@ def validate_trace_structure(trace):
     Returns a list of human-readable problem strings (empty == well-formed).
     Catches the malformed-insertion failure mode where the model nests
     <call_tool>/<tool_output> inside an unclosed <think> block.
+
+    DR Tulu round convention: only the FIRST reasoning block is wrapped
+    <think>...</think>. After each <tool_output>, the model writes its next
+    reasoning *bare* (no opening <think>) and terminates it with a lone
+    </think> before the next <call_tool> (or the <answer>). So a </think> that
+    follows a </tool_output> legitimately closes an *implicit* reasoning block
+    and is NOT a double-close. We model reasoning state as one of:
+        None       -- not currently in a reasoning block
+        'explicit' -- opened by a literal <think>
+        'implicit' -- resumed automatically after </tool_output>
+    Only genuine nesting/imbalance bugs (an *explicit* think left open across a
+    tag, a </think> with no reasoning open at all, a stray </tool_output>) are
+    reported.
     """
     problems = []
     tag_re = re.compile(
-        r"<think>|</think>|<call_tool\b[^>]*>|</call_tool>|<tool_output>|</tool_output>"
+        r"<think>|</think>|<call_tool\b[^>]*>|</call_tool>|<tool_output>|</tool_output>|<answer>"
     )
-    open_think = open_call = open_output = False
+    reasoning = None  # None | 'explicit' | 'implicit'
+    open_call = open_output = False
     for m in tag_re.finditer(trace):
         tag = m.group(0)
         if tag == "<think>":
-            if open_think:
+            if reasoning == "explicit":
                 problems.append(f"@{m.start()}: <think> opened while a <think> was still open")
             if open_call or open_output:
                 problems.append(f"@{m.start()}: <think> opened inside an open <call_tool>/<tool_output>")
-            open_think = True
+            reasoning = "explicit"  # an implicit block being wrapped explicitly is fine
         elif tag == "</think>":
-            if not open_think:
+            if reasoning is None:
                 problems.append(f"@{m.start()}: </think> without a matching open <think>")
-            open_think = False
+            reasoning = None
         elif tag.startswith("<call_tool"):
-            if open_think:
+            if reasoning == "explicit":
                 problems.append(f"@{m.start()}: <call_tool> inside an unclosed <think> block")
             if open_output:
                 problems.append(f"@{m.start()}: <call_tool> inside an open <tool_output>")
+            reasoning = None  # bare post-tool reasoning ends at the next call
             open_call = True
         elif tag == "</call_tool>":
             if not open_call:
                 problems.append(f"@{m.start()}: </call_tool> without a matching open <call_tool>")
             open_call = False
         elif tag == "<tool_output>":
-            if open_think:
+            if reasoning == "explicit":
                 problems.append(f"@{m.start()}: <tool_output> inside an unclosed <think> block")
             if open_call:
                 problems.append(f"@{m.start()}: <tool_output> inside an unclosed <call_tool>")
+            reasoning = None
             open_output = True
         elif tag == "</tool_output>":
             if not open_output:
                 problems.append(f"@{m.start()}: </tool_output> without a matching open <tool_output>")
             open_output = False
-    if open_think:
+            reasoning = "implicit"  # DR Tulu resumes bare reasoning here
+        elif tag == "<answer>":
+            reasoning = None  # reasoning (implicit or explicit) ends at the answer
+    if reasoning == "explicit":
         problems.append("unclosed <think> block at end of trace")
     if open_call:
         problems.append("unclosed <call_tool> block at end of trace")
