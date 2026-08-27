@@ -581,7 +581,7 @@ print(f"Loaded {len(records)} records from {INPUT_FILE}.")
 
 # Process only records[START_INDEX:END_INDEX] (by position in the input file).
 # e.g. START_INDEX=500 runs samples 500..end; END_INDEX caps it. Override via env.
-START_INDEX = int(os.environ.get("START_INDEX", "0"))
+START_INDEX = 0
 END_INDEX   = int(os.environ.get("END_INDEX", str(len(records))))
 records = records[START_INDEX:END_INDEX]
 print(f"Slice [{START_INDEX}:{END_INDEX}] → {len(records)} records.")

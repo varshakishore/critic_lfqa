@@ -9,8 +9,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datasets import load_dataset
 
 # %%
-# OAI_KEY = os.environ["OPENAI_API_KEY"] 
-# client = OpenAI(api_key=OAI_KEY)
+OAI_KEY = os.environ["OPENAI_API_KEY"] 
+client = OpenAI(api_key=OAI_KEY)
 
 
 # updated_prompt = """
@@ -250,7 +250,7 @@ stop_event = threading.Event()   # set when COST_LIMIT is exceeded
 # input_file = "test_samples/drtulu_answers.jsonl"  # set to a .jsonl path to use a local file, or None to load from HF
 # output_file = "test_samples/drtulu_answers_w_critiques.jsonl"  # the file the rewrite pipeline reads
 
-input_file = None
+input_file = "samples_1000/drtulu_answers.jsonl"
 output_file = "samples_1000/drtulu_answers_w_critiques.jsonl"
 
 if input_file is not None:
