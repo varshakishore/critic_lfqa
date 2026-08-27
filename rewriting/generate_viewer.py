@@ -159,15 +159,19 @@ function blockHTML(b,isNew){
     return `<div class="block tool${cls}"><div class="lbl">📄 tool_output ${nt}</div><details class="snips"><summary>${sn.length} snippet${sn.length!==1?'s':''}</summary>${items||'<span class=empty>none</span>'}</details></div>`;}
   if(b.type==='answer')return `<div class="block answerblk"><div class="lbl">answer</div><div class="answer-body">${renderAns(b.body)}</div></div>`;
   return `<div class="block${cls}"><div class="body">${esc(norm(b.body))}</div></div>`;}
-function structProblems(t){const re=/<think>|<\/think>|<call_tool\b[^>]*>|<\/call_tool>|<tool_output>|<\/tool_output>/g;let ot=false,oc=false,oo=false,n=0,m;
+// DR Tulu-aware tag-balance: after </tool_output> reasoning resumes *bare*
+// (implicit), so a lone </think> there is legitimate, not a double-close.
+function structProblems(t){const re=/<think>|<\/think>|<call_tool\b[^>]*>|<\/call_tool>|<tool_output>|<\/tool_output>|<answer>/g;
+  let reasoning=null,oc=false,oo=false,n=0,m;   // reasoning: null | 'explicit' | 'implicit'
   while((m=re.exec(t))){const g=m[0];
-    if(g==='<think>'){if(ot||oc||oo)n++;ot=true;}
-    else if(g==='</think>'){if(!ot)n++;ot=false;}
-    else if(g[1]!=='/'&&g.startsWith('<call_tool')){if(ot||oo)n++;oc=true;}
+    if(g==='<think>'){if(reasoning==='explicit')n++;if(oc||oo)n++;reasoning='explicit';}
+    else if(g==='</think>'){if(reasoning===null)n++;reasoning=null;}
+    else if(g[1]!=='/'&&g.startsWith('<call_tool')){if(reasoning==='explicit')n++;if(oo)n++;reasoning=null;oc=true;}
     else if(g==='</call_tool>'){if(!oc)n++;oc=false;}
-    else if(g==='<tool_output>'){if(ot||oc)n++;oo=true;}
-    else if(g==='</tool_output>'){if(!oo)n++;oo=false;}}
-  return n+(ot?1:0)+(oc?1:0)+(oo?1:0);}
+    else if(g==='<tool_output>'){if(reasoning==='explicit')n++;if(oc)n++;reasoning=null;oo=true;}
+    else if(g==='</tool_output>'){if(!oo)n++;oo=false;reasoning='implicit';}
+    else if(g==='<answer>'){reasoning=null;}}
+  return n+(reasoning==='explicit'?1:0)+(oc?1:0)+(oo?1:0);}
 const KNOWN=new Set(['<think','</think','<call_tool','</call_tool','<tool_output','</tool_output','<snippet','</snippet','<answer','</answer','<cite','</cite']);
 function foreignTags(t){const s=new Set();(t.match(/<\/?[a-zA-Z_]+/g)||[]).forEach(x=>{if(!KNOWN.has(x))s.add(x);});return [...s];}
 function wordDiff(a,b){const A=stripCE(a).replace(/<\/?cite[^>]*>/g,'').split(/(\s+)/),B=stripCE(b).replace(/<\/?cite[^>]*>/g,'').split(/(\s+)/);
