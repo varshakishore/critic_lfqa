@@ -93,6 +93,8 @@ details.crits>summary{cursor:pointer;font-size:12px;text-transform:uppercase;let
 .isnew{outline:2px solid var(--new);outline-offset:1px}
 .newtag{color:var(--new);border:1px solid var(--new);border-radius:999px;font-size:10px;padding:0 6px}
 .reftag{color:#7c3aed;border:1px solid #7c3aed;border-radius:999px;font-size:10px;padding:0 6px}
+.baretag{color:#b45309;border:1px solid #f59e0b;border-radius:999px;font-size:10px;padding:0 6px}
+.block.think.bare{border-style:dashed;border-width:2px}
 details.snips>summary{cursor:pointer;font-size:12px;color:var(--muted)}
 .snip{border-top:1px dashed var(--line);padding:5px 0;margin-top:5px}
 .snip .sid{font-family:ui-monospace,monospace;font-size:11px;color:var(--cite)}
@@ -141,9 +143,16 @@ const stripCE=s=>(s||'').replace(/<\/?can_edit>/g,'');
 const stripAns=s=>(s||'').replace(/<answer>[\s\S]*?<\/answer>/g,'').trim();
 const norm=s=>(s||'').replace(/\s+/g,' ').trim();
 function parseAttrs(s){const o={};const re=/(\w+)="([^"]*)"/g;let m;while((m=re.exec(s)))o[m[1]]=m[2];return o;}
+// DR Tulu convention: only the first reasoning block is wrapped <think>…</think>;
+// reasoning after each <tool_output> is emitted BARE and closed by a lone </think>.
+// A leftover chunk that contains a </think> is such an implicit think block —
+// render it as a think box (strip the tags) instead of raw "other" text.
+function pushChunk(b,x){if(!x.trim())return;
+  if(/<\/think>/.test(x)){b.push({type:'think',body:x.replace(/<\/?think>/g,'').trim(),implicit:true});}
+  else b.push({type:'other',body:x});}
 function parseBlocks(t){t=stripCE(t);const re=/<(think|call_tool|tool_output|answer)\b([^>]*)>([\s\S]*?)<\/\1>/g;const b=[];let last=0,m;
-  while((m=re.exec(t))){if(m.index>last){const x=t.slice(last,m.index);if(x.trim())b.push({type:'other',body:x});}b.push({type:m[1],attrs:m[2],body:m[3]});last=re.lastIndex;}
-  if(last<t.length){const x=t.slice(last);if(x.trim())b.push({type:'other',body:x});}return b;}
+  while((m=re.exec(t))){if(m.index>last)pushChunk(b,t.slice(last,m.index));b.push({type:m[1],attrs:m[2],body:m[3]});last=re.lastIndex;}
+  if(last<t.length)pushChunk(b,t.slice(last));return b;}
 function parseSnippets(b){const re=/<snippet id=([^>]+)>([\s\S]*?)<\/snippet>/g;const o=[];let m;
   while((m=re.exec(b))){const inner=m[2];const tm=inner.match(/Title:\s*([\s\S]*?)(?:\n|$)/);const sm=inner.match(/Snippet:\s*([\s\S]*)/);
   o.push({id:m[1].trim(),title:tm?tm[1].trim():'',text:sm?sm[1].trim():norm(inner)});}return o;}
@@ -152,7 +161,8 @@ function renderAns(body){body=stripCE(body);let h='',last=0;const re=/<cite id="
   h+=esc(body.slice(last));return h;}
 function blockHTML(b,isNew){
   const nt=isNew?'<span class="newtag">NEW</span>':'';const cls=isNew?' isnew':'';
-  if(b.type==='think')return `<div class="block think${cls}"><div class="lbl">💭 think ${nt}</div><div class="body">${esc(stripCE(b.body).trim())}</div></div>`;
+  if(b.type==='think'){const bare=b.implicit?'<span class="baretag" title="reasoning block with no opening &lt;think&gt; tag (DR Tulu bare/post-retrieval reasoning)">no opening &lt;think&gt;</span>':'';
+    return `<div class="block think${cls}${b.implicit?' bare':''}"><div class="lbl">💭 think ${bare} ${nt}</div><div class="body">${esc(stripCE(b.body).trim())}</div></div>`;}
   if(b.type==='call_tool'){const a=parseAttrs(b.attrs||'');const ins=a.limit==='5';const meta=[a.year?('year '+a.year):'',a.fieldsOfStudy?('· '+a.fieldsOfStudy):''].filter(Boolean).join(' ');
     return `<div class="block call${cls}"><div class="lbl">🔍 search ${meta?'<span class="newtag" style="color:var(--muted);border-color:var(--line)">'+esc(meta)+'</span>':''} ${ins?'<span class="reftag">inserted</span>':''} ${nt}</div><div class="body">${esc(stripCE(b.body).trim())}</div></div>`;}
   if(b.type==='tool_output'){const sn=parseSnippets(b.body);const items=sn.map(s=>`<div class="snip"><span class="sid">${esc(s.id)}</span> <span class="st">${esc(s.title)}</span><div class="sx">${esc(s.text)}</div></div>`).join('');
@@ -197,7 +207,8 @@ function renderTraceCol(nameEl,statsEl,bodyEl,rec,label,oldSet,hl){
   if(label!=='(original)'&&!rec.models[label]){bodyEl.innerHTML='<div class=empty>no output for this model on this record</div>';statsEl.textContent='';return;}
   const blocks=parseBlocks(t);
   const nprob=structProblems(t),ft=foreignTags(t),ncall=(t.match(/<call_tool/g)||[]).length;
-  statsEl.innerHTML=`${ncall} call_tool · ${blocks.length} blocks · struct:<span class="${nprob?'bad':''}">${nprob}</span>${ft.length?' · foreign:<span class="bad">'+esc(ft.join(','))+'</span>':''}`;
+  const nthink=blocks.filter(b=>b.type==='think').length,nbare=blocks.filter(b=>b.implicit).length;
+  statsEl.innerHTML=`${ncall} call_tool · ${blocks.length} blocks · think:${nthink} (<span class="${nbare?'bad':''}">${nbare} bare</span>) · struct:<span class="${nprob?'bad':''}">${nprob}</span>${ft.length?' · foreign:<span class="bad">'+esc(ft.join(','))+'</span>':''}`;
   bodyEl.innerHTML=blocks.map(b=>{const key=b.type+'|'+norm(b.body);const isNew=hl&&oldSet&&b.type!=='other'&&!oldSet.has(key);return blockHTML(b,isNew);}).join('')||'<div class=empty>empty</div>';
 }
 function renderAnsCol(nameEl,statsEl,bodyEl,rec,label){
