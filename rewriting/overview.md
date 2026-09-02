@@ -130,9 +130,43 @@ malformed — it's the native format.
 | Answers identical to original (no edit) | 0 |
 | Search rounds inserted (total) | 4500 |
 | Source traces genuinely malformed | 12 / 996 |
-| Rewritten traces flagged | 29 / 996 |
-| **Structure problems introduced by rewriting** | **18 / 996 (1.8%)** |
-| Reflections with hallucinated template tags | ~5 (e.g. rec 24, 247, 481, 525) |
+| Prompt-echo leaks (luna copying its prompt into output) | 10 → **0** (repaired) |
+| **Structure problems introduced by rewriting** | **0 / 996** (was 18; repaired) |
+| Rewritten traces still flagged (inherited from source) | 11 / 996 |
+| Reflections with hallucinated template tags | ~5 (e.g. rec 247, 481, 525) |
+
+Two classes of rewriting-introduced trace damage were found and fixed:
+
+1. **Prompt echo (10 records):** luna occasionally copied its Step-1 rewrite prompt
+   (`--- Critiques to fix …`) into the trace; it survived splicing because it landed
+   inside an editable span. **Fix:** `_strip_prompt_echo()` truncates any leaked
+   scaffold before the diff in `splice_edits`, so difflib reverts that region to the
+   original. Existing file patched (backup: `…_v3.jsonl.bak_preleak`).
+2. **Tag-balance defects (11 records):** in-place edits (8) and search-round
+   insertions (3) introduced stray/nested `<think>`/`</think>`/`</tool_output>` tags.
+   **Fix:** `normalize_trace_structure()` applies minimal, tag-only repairs (never
+   touches prose) and runs as a guard after Step 1b. Existing file patched.
+
+After both fixes: **0 structure problems introduced by rewriting**; the only 11
+still-flagged traces carry malformation inherited from the source DR Tulu traces.
+
+3. **Snippet-id format/scheme mismatch:** inserted search rounds used a fabricated
+   6-hex prefix (`hash(query) % 0xFFFFFF`, e.g. `1de5a6-0`) while DR Tulu's native
+   snippet ids are 8-hex, unique per round (e.g. `ad1dd40e-0`). DR Tulu's actual
+   `generate_snippet_id()` is `md5(uuid4())[:8]` — a **random** 8-hex per round.
+   **Fix:** `new_snippet_id()` now matches it exactly (`md5(uuid4())[:8]`, random,
+   generated once per round; `insert_search_rounds` resolves it by query via
+   `search_results`). Existing file retrofitted twice — first 6-hex→8-hex, then to
+   genuinely random ids — remapping snippet ids and answer cites together, single-
+   pass so every cite still resolves. Verified: 0 six-hex remaining, 0 cross-record
+   shared prefixes, dangling-cite count invariant (177 before = 177 after, so no
+   regression). Backups: `…_v3.jsonl.bak_pre_idfix` (pre-retrofit).
+
+**Separate pre-existing issue (not fixed — a DR Tulu data characteristic):** answers
+cite snippet ids absent from their own trace — 177 in the rewritten answers, and
+**350 in DR Tulu's own original answers** (baseline). Includes citing a snippet
+index that was never retrieved (e.g. `-5` when the round returned indices 0–4).
+Unrelated to id format; inherited from the source data.
 
 **Key finding:** an initial scan showed 621/996 traces "malformed," but this was a
 validator bug — it enforced strict XML nesting and flagged DR Tulu's native

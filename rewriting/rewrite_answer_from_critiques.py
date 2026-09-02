@@ -3,6 +3,8 @@ import json
 import os
 import re
 import time
+import uuid
+import hashlib
 import difflib
 import threading
 import requests
@@ -209,6 +211,16 @@ def run_s2_search(query_dict, limit=5, max_retries=6):
     return []
 
 
+def new_snippet_id():
+    """Fresh per-round snippet-id prefix, matching DR Tulu's generate_snippet_id():
+    md5 of a random uuid4, first 8 hex chars. It is RANDOM (not derived from the
+    query) on purpose — DR Tulu assigns even identical queries different ids, so a
+    deterministic query-hash would be a tell that distinguishes inserted rounds
+    from native ones. Generated once per round; all that round's snippets share it
+    (id-0 … id-N). insert_search_rounds resolves it by query via search_results."""
+    return hashlib.md5(str(uuid.uuid4()).encode("utf-8")).hexdigest()[:8]
+
+
 def make_tool_output(results, id_prefix):
     """Format search results as a <tool_output> block (no <call_tool> wrapper)."""
     snippets = []
@@ -324,6 +336,20 @@ def _in_editable(i1, i2, spans):
     return False
 
 
+# Marker for the prompt scaffold ("--- Critiques to fix …") that a weak model
+# sometimes echoes into its output instead of just editing. If it leaks, it
+# lands inside the final editable span and survives the splice, so strip it
+# BEFORE diffing — difflib then reads the echo as a deletion and the splice
+# reverts that region to the original trace tail.
+_PROMPT_ECHO_RE = re.compile(r"\n*(?:-{2,}\s*\n)?Critiques to fix[^\n]*:")
+
+
+def _strip_prompt_echo(text):
+    """Truncate model output at the first leaked prompt-scaffold marker."""
+    m = _PROMPT_ECHO_RE.search(text)
+    return text[:m.start()] if m else text
+
+
 def splice_edits(original, critiques, model_output):
     """Diff-based revert: keep the model's text ONLY where it maps inside an
     editable span; revert every other change back to the original. Guarantees
@@ -335,7 +361,7 @@ def splice_edits(original, critiques, model_output):
     spans (out-of-bounds drift, or edits the model placed in the wrong region —
     e.g. searches inserted outside a mis-placed insertion span)."""
     spans = compute_edit_spans(original, critiques)
-    mo = model_output.replace("<can_edit>", "").replace("</can_edit>", "")
+    mo = _strip_prompt_echo(model_output).replace("<can_edit>", "").replace("</can_edit>", "")
 
     out, dropped = [], 0
     for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, original, mo, autojunk=False).get_opcodes():
@@ -449,6 +475,8 @@ def insert_search_rounds(trace, search_critiques, search_results):
     construction — the model never sees a tag."""
     inserts = []  # (position, text)
     refl_in = refl_out = 0
+    # ids are random (per DR Tulu), so resolve each query's id from search_results
+    query_to_pid = {qd["query"]: pid for pid, (qd, _) in search_results.items()}
     for c in search_critiques:
         spans = c.get("edit_span", c.get("critique_span", []))
         anchor = next((_norm_span(p)[0] for p in spans if _norm_span(p)), None)
@@ -472,8 +500,8 @@ def insert_search_rounds(trace, search_critiques, search_results):
             pos = b if (b != -1 and b > trace.rfind("</think>", 0, idx)) else idx
         rounds = []
         for q in c.get("s2_search_queries", []):
-            pid = hex(abs(hash(q["query"])) % 0xFFFFFF)[2:].zfill(6)
-            if pid not in search_results:
+            pid = query_to_pid.get(q["query"])
+            if pid is None or pid not in search_results:
                 print(f"    ⚠ no results for query (skipped): {q['query'][:50]}")
                 continue
             _, tool_output_text = search_results[pid]
@@ -559,6 +587,61 @@ def validate_trace_structure(trace):
     if open_output:
         problems.append("unclosed <tool_output> block at end of trace")
     return problems
+
+
+def normalize_trace_structure(trace, max_iter=40):
+    """Repair the small tag-balance defects that an in-place edit or a search-round
+    insertion can introduce, with MINIMAL, tag-only edits (never touches prose):
+
+      - <call_tool>/<tool_output> inside an unclosed <think>  -> insert the missing
+        </think> just before the tag (DR Tulu closes reasoning before a tool call)
+      - <tool_output> inside an unclosed <call_tool>           -> insert </call_tool>
+      - <call_tool> inside an open <tool_output>               -> insert </tool_output>
+      - stray </think> / </tool_output> / </call_tool> with no open match -> delete it
+      - a <think> opened while one is still open (nesting)     -> delete the inner opener
+      - an unclosed block at end of trace                      -> append its closer
+
+    Processes one problem at a time, left to right, re-validating after each fix so
+    corrections cascade. Returns the repaired trace (unchanged if already clean)."""
+    for _ in range(max_iter):
+        problems = validate_trace_structure(trace)
+        if not problems:
+            return trace
+        # positional problems first (they usually unblock the end-of-trace ones)
+        pos_probs = [p for p in problems if p.startswith("@")]
+        if pos_probs:
+            p = pos_probs[0]
+            pos = int(re.match(r"@(\d+):", p).group(1))
+            if "inside an unclosed <think>" in p:
+                trace = trace[:pos] + "</think>\n" + trace[pos:]
+            elif "inside an unclosed <call_tool>" in p:
+                trace = trace[:pos] + "</call_tool>\n" + trace[pos:]
+            elif "inside an open <tool_output>" in p:
+                trace = trace[:pos] + "</tool_output>\n" + trace[pos:]
+            elif "</think> without a matching open" in p:
+                trace = trace[:pos] + trace[pos + len("</think>"):]
+            elif "</tool_output> without a matching open" in p:
+                trace = trace[:pos] + trace[pos + len("</tool_output>"):]
+            elif "</call_tool> without a matching open" in p:
+                trace = trace[:pos] + trace[pos + len("</call_tool>"):]
+            elif "<think> opened while a <think> was still open" in p:
+                trace = trace[:pos] + trace[pos + len("<think>"):]
+            elif "<think> opened inside an open <call_tool>/<tool_output>" in p:
+                trace = trace[:pos] + trace[pos + len("<think>"):]
+            else:
+                return trace  # unknown positional problem: don't risk a bad edit
+        else:
+            # only end-of-trace unclosed-block problems remain
+            t = trace.rstrip()
+            if "unclosed <think> block at end of trace" in problems:
+                trace = t + "\n</think>"
+            elif "unclosed <tool_output> block at end of trace" in problems:
+                trace = t + "\n</tool_output>"
+            elif "unclosed <call_tool> block at end of trace" in problems:
+                trace = t + "\n</call_tool>"
+            else:
+                return trace
+    return trace
 
 
 def parse_critique(s):
@@ -662,7 +745,7 @@ def process_record(item):
     search_results = {}
     for q in search_queries:
         print(f"  Searching: {q['query'][:70]}...")
-        id_prefix = hex(abs(hash(q["query"])) % 0xFFFFFF)[2:].zfill(6)
+        id_prefix = new_snippet_id()
         results = run_s2_search(q)
         if results:
             search_results[id_prefix] = (q, make_tool_output(results, id_prefix))
@@ -734,13 +817,20 @@ def process_record(item):
             print(f"  ⚠ TRACE: reverted {trace_dropped} chars of OUT-OF-BOUNDS model edits for "
                   f"'{question[:50]}' — likely searches inserted outside a mis-placed edit_span")
 
-    # Warn if the final trace has broken DR Tulu block structure (e.g. <call_tool>
-    # nested inside an unclosed <think>).
+    # Structural guard: repair any tag-balance defects an in-place edit or a
+    # search-round insertion introduced (minimal, tag-only fixes; never prose).
+    _pre = validate_trace_structure(rewritten_trace)
+    if _pre:
+        rewritten_trace = normalize_trace_structure(rewritten_trace)
+
+    # Warn only if something is STILL broken after the repair pass.
     struct_problems = validate_trace_structure(rewritten_trace)
     if struct_problems:
-        print(f"  ⚠ MALFORMED TRACE for '{question[:50]}': {len(struct_problems)} issue(s)")
+        print(f"  ⚠ MALFORMED TRACE for '{question[:50]}' (unrepaired): {len(struct_problems)} issue(s)")
         for p in struct_problems[:5]:
             print(f"      - {p}")
+    elif _pre:
+        print(f"  ✓ normalized {len(_pre)} trace structure issue(s) for '{question[:50]}'")
 
     # Warn if any placeholder was left unfilled (query returned no results, or
     # the model altered the placeholder token).
